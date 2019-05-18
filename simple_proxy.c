@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <errno.h>
 
 #define LISTENNQ 5
 #define MAX_RESPONSE 8192
@@ -51,6 +52,7 @@ void signal_handler(int sig_num) {
 
 
 int main(int argc, char** argv) {
+    /* signal(SIGPIPE, SIG_IGN); */
     signal(SIGINT, signal_handler);
 
     if (argc != 1) {
@@ -126,37 +128,31 @@ void* process_request(int connfd) {
     struct request_header request;
     char *token;
     char receive[MAX_RESPONSE] = {0};
-    char buff = 0;
 
     /* print request */
-    int n;
-    int i = 0;
-    while (i < MAX_RESPONSE) {
-        n = recv(connfd, &buff, 1, 0);
-        /* printf("%c\n", buff); */
+    int n = recv(connfd, receive, MAX_RESPONSE - 1, 0);
 
-        if(n <= 0) {
-            break;
-        }
-
-        receive[i++] = buff;
-
-        /* HTTP header end with "\r\n\r\n" */
-        if(strcmp(receive + i - 4, "\r\n\r\n") == 0) {
-            break;
-        }
-        /* printf("after checking\n"); */
-    }
-
-    printf("after recv\n");
-    receive[i] = '\0';
-    printf("after recv 2\n");
-    printf("%s\n", receive);
-    printf("after recv 3\n");
-    if (i == 0) {
+    if(n <= 0) {
         close(connfd);
         return 0;
     }
+
+    receive[n] = '\0';
+
+    /* HTTP header end with "\r\n\r\n" */
+    /* if(strcmp(receive + i - 4, "\r\n\r\n") == 0) { */
+        /* break; */
+    /* } */
+
+    printf("after recv\n");
+    /* receive[i] = '\0'; */
+    printf("after recv 2\n");
+    printf("%s\n", receive);
+    printf("after recv 3\n");
+    /* if (i == 0) { */
+        /* close(connfd); */
+        /* return 0; */
+    /* } */
 
     token = strtok(receive, "\r\n");
     sscanf(token, "%s %s %s", request.method, request.url, request.version);
@@ -280,54 +276,45 @@ int send_request(int connfd, struct request_header request) {
         token = strtok(NULL, "\r\n");
     }
 
+    i = 0;
     if (type == 1) {
-        i = 0;
         while (1) {
-            n = recv(sockfd, &buff, 1, 0);
+            n = recv(sockfd, receive, MAX_RESPONSE - 1, 0);
 
             if(n <= 0) {
                 break;
             }
 
-            receive[i++] = buff;
-            if (i == MAX_RESPONSE - 1) {
-                receive[i] = '\0';
-                send(connfd, receive, strlen(receive), 0);
-                printf("%s\n", receive);
-                i = 0;
-            }
+            receive[n] = '\0';
+            send(connfd, receive, strlen(receive), 0);
+            /* printf("%s\n", receive); */
 
-            if (!strcmp(receive + i - 5, "0\r\n\r\n")) {
+            if (!strcmp(receive + n - 5, "0\r\n\r\n")) {
                 break;
             }
         }
     } else if (type == 2) {
-        printf("%d %d\n", type, length);
         i = 0;
-        for (int j = 0; j < length; j++) {
-            n = recv(sockfd, &buff, 1, 0);
+        int buffer[MAX_RESPONSE] = {0};
+        while (length > 0) {
+            n = recv(sockfd, buffer, MAX_RESPONSE - 1, MSG_WAITALL);
 
             if(n <= 0) {
                 break;
             }
 
-            receive[i++] = buff;
-            if (i == MAX_RESPONSE - 1) {
-                receive[i] = '\0';
-                send(connfd, receive, strlen(receive), 0);
-                printf("%s\n", receive);
-                i = 0;
-            }
+            receive[n] = '\0';
+            send(connfd, buffer, n, 0);
+
+            length -= n;
+            printf("%d\n", length);
         }
     } else {
         printf("Error: No length method\n");
         return -1;
     }
 
-    receive[i] = '\0';
-    send(connfd, receive, strlen(receive), 0);
-    printf("%s\n", receive);
-    printf("DONE receive response");
+    printf("DONE receive response\n");
 
 
     /* close the connection */
