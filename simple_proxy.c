@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #define LISTENNQ 5
 #define MAX_RESPONSE 8192
 #define MAX_LINE 2048
+#define MAX_THREAD 10
 #define SERVER_PORT "12345"
 
 struct arg_struct {
@@ -36,23 +38,27 @@ struct request_header {
 
 int listenfd;
 int connfd;
-int free_thread_count = 0;
+pthread_t threads[MAX_THREAD];
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int initialize_server(char* port);
 int server_loop();
-void* process_request(int connfd);
+void* thread_process(void* args);
+void process_request(int connfd);
 int send_request(int connfd, struct request_header request);
 void header_struct_to_string(struct request_header request, char* output);
 
 void signal_handler(int sig_num) {
     printf("Disconnect\n");
+    shutdown(listenfd, SHUT_RDWR);
     close(listenfd);
     exit(0);
 }
 
 
 int main(int argc, char** argv) {
-    /* signal(SIGPIPE, SIG_IGN); */
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
 
     if (argc != 1) {
@@ -85,6 +91,12 @@ int initialize_server(char* port) {
         return -1;
     }
 
+    int yes = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+        perror("setsockop");
+        return -1;
+    }
+
     /* bind the socket to the server address */
     if (bind(listenfd, res->ai_addr, res->ai_addrlen) < 0) {
         printf("Error: bind\n");
@@ -101,28 +113,36 @@ int initialize_server(char* port) {
 }
 
 int server_loop() {
-    int connfd;
-    struct sockaddr_in client_addr;
-    socklen_t length = sizeof(struct sockaddr_in);
+    for (int i = 0; i < MAX_THREAD; i++) {
+        pthread_create(&(threads[i]), NULL, thread_process, NULL);
+    }
 
-    /* keep processing incoming requests */
-    while (1) {
-        printf("loop\n");
-        /* accept an incoming connection form the remote side */
-        connfd = accept(listenfd, (struct sockaddr *)&client_addr, &length);
-        if (connfd < 0) {
-            printf("Error: accept\n");
-            return -1;
-        }
-        printf("accept\n");
-
-        process_request(connfd);
+    for (int i = 0; i < MAX_THREAD; i++) {
+        pthread_join(threads[i], NULL);
     }
 
     return 0;
 }
 
-void* process_request(int connfd) {
+void* thread_process() {
+    int connfd;
+    struct sockaddr_in client_addr;
+    socklen_t length = sizeof(struct sockaddr_in);
+
+    while (1) {
+        /* accept an incoming connection form the remote side */
+        connfd = accept(listenfd, (struct sockaddr *)&client_addr, &length);
+        if (connfd < 0) {
+            printf("Error: accept\n");
+            return 0;
+        }
+        printf("accept\n");
+
+        process_request(connfd);
+    }
+}
+
+void process_request(int connfd) {
     printf("processing request\n");
 
     struct request_header request;
@@ -134,7 +154,7 @@ void* process_request(int connfd) {
 
     if(n <= 0) {
         close(connfd);
-        return 0;
+        return;
     }
 
     receive[n] = '\0';
@@ -171,12 +191,12 @@ void* process_request(int connfd) {
         /* TODO: SUPPORT IT */
         close(connfd);
 
-        return 0;
+        return;
         /* HTTPS */
     } else {
         printf("UNKNOWN METHOD: %s\n", request.method);
 
-        return 0;
+        return;
     }
     request.field_counter = 0;
 
@@ -198,7 +218,7 @@ void* process_request(int connfd) {
     /* close the connection */
     close(connfd);
 
-    return 0;
+    return;
 }
 
 int send_request(int connfd, struct request_header request) {
@@ -295,19 +315,26 @@ int send_request(int connfd, struct request_header request) {
         }
     } else if (type == 2) {
         i = 0;
-        int buffer[MAX_RESPONSE] = {0};
         while (length > 0) {
-            n = recv(sockfd, buffer, MAX_RESPONSE - 1, MSG_WAITALL);
+            n = recv(sockfd, receive, MAX_RESPONSE - 1, 0);
 
             if(n <= 0) {
                 break;
             }
 
-            receive[n] = '\0';
-            send(connfd, buffer, n, 0);
+            int total = 0;
+            int bytesleft = n;
+            int m;
+            while (total < n) {
+                m = send(connfd, receive + total, bytesleft, 0);
+                if (m == -1) {
+                    break;
+                }
+                total += m;
+                bytesleft -= m;
+            }
 
             length -= n;
-            printf("%d\n", length);
         }
     } else {
         printf("Error: No length method\n");
