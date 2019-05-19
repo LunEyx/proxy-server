@@ -44,10 +44,29 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int initialize_server(char* port);
 int server_loop();
+int send_all(int fd, char* msg, int byte_left);
 void* thread_process(void* args);
 void process_request(int connfd);
-int send_request(int connfd, struct request_header request);
 void header_struct_to_string(struct request_header request, char* output);
+int http_request(int connfd, struct request_header request);
+void https_request(int connfd, struct request_header request);
+
+int send_all(int fd, char* msg, int byte_left) {
+    int total = 0;
+    int n;
+
+    while (byte_left) {
+        n = send(fd, msg + total, byte_left, 0);
+        total += n;
+        byte_left -= n;
+
+        if (n <= 0) {
+            break;
+        }
+    }
+
+    return byte_left ? -1 : 0;
+}
 
 void signal_handler(int sig_num) {
     printf("Disconnect\n");
@@ -55,7 +74,6 @@ void signal_handler(int sig_num) {
     close(listenfd);
     exit(0);
 }
-
 
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
@@ -75,33 +93,48 @@ int main(int argc, char** argv) {
 }
 
 int initialize_server(char* port) {
-    struct addrinfo hints, *res;
+    struct addrinfo hints, *res, *p;
 
     /* initial setting */
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    getaddrinfo(NULL, port, &hints, &res);
+    if (getaddrinfo(NULL, port, &hints, &res)) {
+        printf("Error: get address info\n");
+        return -1;
+    }
 
     /* initialize server socket */
-    listenfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (listenfd < 0) {
-        printf("Error: init socket\n");
+    for (p = res; p != NULL; p = p->ai_next) {
+        listenfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (listenfd < 0) {
+            printf("Error: init socket\n");
+            continue;
+        }
+
+        int yes = 1;
+        if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+            perror("setsockop");
+            continue;
+        }
+
+        /* bind the socket to the server address */
+        if (bind(listenfd, res->ai_addr, res->ai_addrlen) < 0) {
+            printf("Error: bind\n");
+            close(listenfd);
+            continue;
+        }
+
+        break;
+    }
+
+    if (p == NULL) {
+        printf("Failed to bind socket\n");
         return -1;
     }
 
-    int yes = 1;
-    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-        perror("setsockop");
-        return -1;
-    }
-
-    /* bind the socket to the server address */
-    if (bind(listenfd, res->ai_addr, res->ai_addrlen) < 0) {
-        printf("Error: bind\n");
-        return -1;
-    }
+    freeaddrinfo(res);
 
     /* listen to the socket */
     if (listen(listenfd, LISTENNQ) < 0) {
@@ -150,29 +183,24 @@ void process_request(int connfd) {
     char receive[MAX_RESPONSE] = {0};
 
     /* print request */
-    int n = recv(connfd, receive, MAX_RESPONSE - 1, 0);
+    int n = 0;
+    while (1) {
+        n += recv(connfd, receive + n, MAX_RESPONSE - 1 - n, 0);
 
-    if(n <= 0) {
-        close(connfd);
-        return;
+        if(n <= 0) {
+            close(connfd);
+            return;
+        }
+
+        receive[n] = '\0';
+
+        /* HTTP header end with "\r\n\r\n" */
+        if(strcmp(receive + n - 4, "\r\n\r\n") == 0) {
+            break;
+        }
     }
 
-    receive[n] = '\0';
-
-    /* HTTP header end with "\r\n\r\n" */
-    /* if(strcmp(receive + i - 4, "\r\n\r\n") == 0) { */
-        /* break; */
-    /* } */
-
-    printf("after recv\n");
-    /* receive[i] = '\0'; */
-    printf("after recv 2\n");
     printf("%s\n", receive);
-    printf("after recv 3\n");
-    /* if (i == 0) { */
-        /* close(connfd); */
-        /* return 0; */
-    /* } */
 
     token = strtok(receive, "\r\n");
     sscanf(token, "%s %s %s", request.method, request.url, request.version);
@@ -182,36 +210,50 @@ void process_request(int connfd) {
         /* HTTP */
         printf("HTTP METHOD\n");
 
-        printf("before sscanf\n");
         sscanf(request.url, "http://%[^/]%s", request.host, request.path);
-        printf("after sscanf\n");
         printf("%s %s\n", request.host, request.path);
         strcpy(request.port, "80");
-    } else if (!strcmp(request.method, "CONNECT")) {
-        /* TODO: SUPPORT IT */
-        close(connfd);
+        request.field_counter = 0;
 
-        return;
+        token = strtok(NULL, "\r\n");
+        while (token != NULL) {
+            int n = sscanf(token, "%[^:]: %[^\n]", request.field_names[request.field_counter], request.values[request.field_counter]);
+            printf("%s: %s\n", request.field_names[request.field_counter], request.values[request.field_counter]);
+            if (n <= 0) {
+                break;
+            }
+
+            request.field_counter++;
+
+            token = strtok(NULL, "\r\n");
+        }
+        printf("http request\n");
+        http_request(connfd, request);
+    } else if (!strcmp(request.method, "CONNECT")) {
         /* HTTPS */
+        printf("HTTPS METHOD\n");
+
+        sscanf(request.url, "%[^:]:%s", request.host, request.port);
+        printf("%s:%s\n", request.host, request.port);
+        request.field_counter = 0;
+
+        token = strtok(NULL, "\r\n");
+        while (token != NULL) {
+            int n = sscanf(token, "%[^:]: %[^\n]", request.field_names[request.field_counter], request.values[request.field_counter]);
+            if (n <= 0) {
+                break;
+            }
+
+            request.field_counter++;
+
+            token = strtok(NULL, "\r\n");
+        }
+        https_request(connfd, request);
     } else {
         printf("UNKNOWN METHOD: %s\n", request.method);
 
         return;
     }
-    request.field_counter = 0;
-
-    token = strtok(NULL, "\r\n");
-    while (token != NULL) {
-        int n = sscanf(token, "%[^:]: %[^\n]", request.field_names[request.field_counter], request.values[request.field_counter]);
-        if (n <= 0) {
-            break;
-        }
-
-        request.field_counter++;
-
-        token = strtok(NULL, "\r\n");
-    }
-    send_request(connfd, request);
 
     printf("Request '%s' done!\n", request.url);
 
@@ -221,8 +263,25 @@ void process_request(int connfd) {
     return;
 }
 
-int send_request(int connfd, struct request_header request) {
-    struct addrinfo hints, *res;
+void header_struct_to_string(struct request_header request, char* output) {
+    char line[MAX_LINE] = {0};
+    sprintf(output, "%s %s %s\r\n", request.method, request.path, request.version);
+
+    for (int i = 0; i < request.field_counter; i++) {
+        if (!strcmp(request.field_names[i], "Accept-Encoding")) {
+        } else if (!strcmp(request.field_names[i], "Proxy-Connection")) {
+            sprintf(line, "%s: %s\r\n", "Connection", request.values[i]);
+        } else {
+            sprintf(line, "%s: %s\r\n", request.field_names[i], request.values[i]);
+        }
+        strcat(output, line);
+    }
+
+    strcat(output, "\r\n\r\n");
+}
+
+int http_request(int connfd, struct request_header request) {
+    struct addrinfo hints, *res, *p;
     int sockfd;
     char receive[MAX_RESPONSE] = {0};
     char output[MAX_RESPONSE] = {0};
@@ -231,20 +290,41 @@ int send_request(int connfd, struct request_header request) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    getaddrinfo(request.host, request.port, &hints, &res);
-
-    sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-
-    /* connect to the server */
-    if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-        printf("Error: connect\n");
-        return -1;
+    if (getaddrinfo(request.host, request.port, &hints, &res)) {
+        printf("Error: get address info\n");
+        char msg[] = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+        printf("Send message: %s\n", msg);
+        send_all(connfd, msg, strlen(msg));
+        return 0;
     }
+
+    for (p = res; p != NULL; p = p->ai_next) {
+        sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sockfd < 0) {
+            continue;
+        }
+
+        /* connect to the server */
+        if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
+            continue;
+        }
+
+        break;
+    }
+
+    if (p == NULL) {
+        char msg[] = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+        printf("Send message: %s\n", msg);
+        send_all(connfd, msg, strlen(msg));
+        return 0;
+    }
+
+    freeaddrinfo(res);
 
     header_struct_to_string(request, output);
 
     printf("%s\n", output);
-    send(sockfd, output, strlen(output), 0);
+    send_all(sockfd, output, strlen(output));
 
     /* read the response */
     int n;
@@ -267,7 +347,7 @@ int send_request(int connfd, struct request_header request) {
 
     receive[i] = '\0';
     printf("%s", receive);
-    send(connfd, receive, strlen(receive), 0);
+    send_all(connfd, receive, strlen(receive));
 
     int type = 0; /* 1: chunk; 2: length */
     int length = 0;
@@ -306,8 +386,7 @@ int send_request(int connfd, struct request_header request) {
             }
 
             receive[n] = '\0';
-            send(connfd, receive, strlen(receive), 0);
-            /* printf("%s\n", receive); */
+            send_all(connfd, receive, n);
 
             if (!strcmp(receive + n - 5, "0\r\n\r\n")) {
                 break;
@@ -322,23 +401,27 @@ int send_request(int connfd, struct request_header request) {
                 break;
             }
 
-            int total = 0;
-            int bytesleft = n;
-            int m;
-            while (total < n) {
-                m = send(connfd, receive + total, bytesleft, 0);
-                if (m == -1) {
-                    break;
-                }
-                total += m;
-                bytesleft -= m;
-            }
+            receive[n] = '\0';
+            send_all(connfd, receive, n);
 
             length -= n;
         }
     } else {
-        printf("Error: No length method\n");
-        return -1;
+        printf("No length method\n");
+        while (1) {
+            n = recv(sockfd, receive, MAX_RESPONSE - 1, 0);
+
+            if(n <= 0) {
+                break;
+            }
+
+            receive[n] = '\0';
+            send_all(connfd, receive, n);
+
+            if (!strcmp(receive + n - 5, "0\r\n\r\n")) {
+                break;
+            }
+        }
     }
 
     printf("DONE receive response\n");
@@ -350,21 +433,6 @@ int send_request(int connfd, struct request_header request) {
     return 0;
 }
 
-void header_struct_to_string(struct request_header request, char* output) {
-    char line[MAX_LINE] = {0};
-    sprintf(output, "%s %s %s\r\n", request.method, request.path, request.version);
-
-    for (int i = 0; i < request.field_counter; i++) {
-        if (!strcmp(request.field_names[i], "Accept-Encoding")) {
-        } else if (!strcmp(request.field_names[i], "Proxy-Connection")) {
-            sprintf(line, "%s: %s\r\n", "Connection", request.values[i]);
-        } else {
-            sprintf(line, "%s: %s\r\n", request.field_names[i], request.values[i]);
-        }
-        strcat(output, line);
-    }
-
-    strcat(output, "\r\n\r\n");
+void https_request(int connfd, struct request_header request) {
 }
-
 
