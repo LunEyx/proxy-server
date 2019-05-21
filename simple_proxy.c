@@ -39,17 +39,19 @@ struct request_header {
 int listenfd;
 int connfd;
 pthread_t threads[MAX_THREAD];
-
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+char access_denied[][MAX_LINE] = {"www.padpadblog.com", "beej-zhtw.netdpi.net"};
 
 int initialize_server(char* port);
 int server_loop();
 int send_all(int fd, char* msg, int byte_left);
 void* thread_process(void* args);
-void process_request(int connfd);
+void receive_request(int connfd);
+void process_request(int connfd, char* receive);
 void header_struct_to_string(struct request_header request, char* output);
 int http_request(int connfd, struct request_header request);
-void https_request(int connfd, struct request_header request);
+int https_request(int connfd, struct request_header request);
 
 int send_all(int fd, char* msg, int byte_left) {
     int total = 0;
@@ -171,15 +173,13 @@ void* thread_process() {
         }
         printf("accept\n");
 
-        process_request(connfd);
+        receive_request(connfd);
     }
 }
 
-void process_request(int connfd) {
+void receive_request(int connfd) {
     printf("processing request\n");
 
-    struct request_header request;
-    char *token;
     char receive[MAX_RESPONSE] = {0};
 
     /* print request */
@@ -201,8 +201,16 @@ void process_request(int connfd) {
     }
 
     printf("%s\n", receive);
+    process_request(connfd, receive);
+}
 
-    token = strtok(receive, "\r\n");
+void process_request(int connfd, char* receive) {
+    struct request_header request;
+    char *token;
+    char temp[MAX_RESPONSE];
+
+    strcpy(temp, receive);
+    token = strtok(temp, "\r\n");
     sscanf(token, "%s %s %s", request.method, request.url, request.version);
     printf("%s %s %s\n", request.method, request.url, request.version);
 
@@ -212,6 +220,15 @@ void process_request(int connfd) {
 
         sscanf(request.url, "http://%[^/]%s", request.host, request.path);
         printf("%s %s\n", request.host, request.path);
+        for (int i = 0; i < sizeof(access_denied) / MAX_LINE; i++) {
+            printf("Checking: %s vs %s\n", access_denied[i], request.host);
+            if (!strcmp(access_denied[i], request.host)) {
+                char msg[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+                send_all(connfd, msg, strlen(msg));
+                close(connfd);
+                return;
+            }
+        }
         strcpy(request.port, "80");
         request.field_counter = 0;
 
@@ -433,6 +450,6 @@ int http_request(int connfd, struct request_header request) {
     return 0;
 }
 
-void https_request(int connfd, struct request_header request) {
+int https_request(int connfd, struct request_header request) {
 }
 
